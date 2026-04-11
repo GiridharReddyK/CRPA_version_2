@@ -154,13 +154,20 @@ def cached_s_matrix(n_elements: int, coupling_mag: float, isolation_db: float):
 
 @st.cache_data
 def cached_3d_pattern(
-    _w_tuple, _pos_tuple, freq_hz, az_pts, el_pts,
-    _coupling_tuple, _has_aep, _aep_hash,
+    _w_real, _w_imag, _pos_tuple, n_elements, freq_hz, az_pts, el_pts,
+    _c_real, _c_imag,
 ):
-    """Cache-friendly 3D pattern evaluation."""
-    w = np.array(_w_tuple)
-    positions = np.array(_pos_tuple)
-    coupling = np.array(_coupling_tuple) if _coupling_tuple is not None else None
+    """Cache-friendly 3D pattern evaluation.
+
+    Complex arrays are split into real/imag tuples for hashability.
+    Shape information is reconstructed from n_elements.
+    """
+    w = np.array(_w_real) + 1j * np.array(_w_imag)
+    positions = np.array(_pos_tuple).reshape(n_elements, 3)
+    coupling = (
+        (np.array(_c_real) + 1j * np.array(_c_imag)).reshape(n_elements, n_elements)
+        if _c_real is not None else None
+    )
 
     az_grid = np.linspace(0, 360, az_pts)
     el_grid = np.linspace(0, 90, el_pts)
@@ -452,13 +459,15 @@ def main() -> None:
                                   help='Higher = smoother but slower')
 
         w_for_3d = w_quant if cfg.quant.enabled else w_ideal
-        _w_t = tuple(w_for_3d.ravel().tolist())
+        _w_r = tuple(w_for_3d.real.tolist())
+        _w_i = tuple(w_for_3d.imag.tolist())
         _p_t = tuple(positions.ravel().tolist())
-        _c_t = tuple(C.ravel().tolist())
+        _c_r = tuple(C.real.ravel().tolist())
+        _c_i = tuple(C.imag.ravel().tolist())
 
         result, az_3d, el_3d = cached_3d_pattern(
-            _w_t, _p_t, freq, res_3d, res_3d // 2,
-            _c_t, interpolators is not None, hash(str(n)),
+            _w_r, _w_i, _p_t, n, freq, res_3d, res_3d // 2,
+            _c_r, _c_i,
         )
         fig_3d = plot_3d_pattern(az_3d, el_3d, result, dynamic_range=40.0)
         st.plotly_chart(fig_3d, use_container_width=True)
