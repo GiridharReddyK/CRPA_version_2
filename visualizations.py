@@ -1,11 +1,24 @@
 """
 visualizations.py — Plotting Engine for CRPA Null Steering Dashboard
+====================================================================
 
-All visualization logic is encapsulated here to keep the Streamlit
-app.py clean. Uses Plotly for interactive 3D and Matplotlib for
-publication-quality 2D polar/Cartesian plots.
+Production-grade visualization module with:
+  - Matplotlib 2D polar/Cartesian pattern plots
+  - Plotly 3D radiation surface (OPTIMIZED to prevent browser freeze)
+  - Weight vector / phasor diagrams
+  - Polarisation analysis visualizations
+  - STAP space-time response plots
+  - Wideband squint analysis
+  - Coupling matrix heatmaps
+  - AEP pattern colour maps
 
-Colour scheme: dark-theme engineering dashboard palette.
+3D FIX: The previous plot_3d_pattern froze Streamlit because it sent
+the FULL dense Surface mesh to Plotly's WebGL renderer, overwhelming
+the browser. Fixed by:
+  1. Limiting surface vertices to ~3,600 max (60×60)
+  2. Using decimation/downsampling on input grids
+  3. Enabling WebGL-optimized Plotly rendering hints
+  4. Reducing colorbar and annotation complexity
 """
 
 from __future__ import annotations
@@ -18,22 +31,24 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Optional, List, Tuple
-from rf_physics import JammerConfig, QuantConfig
+from typing import Optional, List, Tuple, Dict
+
+# Import only the types we need from rf_physics (avoid circular deps)
+from rf_physics import JammerConfig, QuantConfig, Polarisation
 
 
-# ---------------------------------------------------------------------------
-# Colour Constants (Dark Engineering Theme)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  COLOUR CONSTANTS — Dark Engineering Dashboard Theme
+# ═══════════════════════════════════════════════════════════════════════════
 
-DARK_BG = '#0a0e17'
-PANEL_BG = '#101825'
-GRID_COLOR = '#1e2d42'
-TEXT_COLOR = '#c8d6e5'
-ACCENT_CYAN = '#00d2ff'
-ACCENT_GREEN = '#00ff88'
-ACCENT_RED = '#ff3355'
-ACCENT_AMBER = '#ffaa00'
+DARK_BG       = '#0a0e17'
+PANEL_BG      = '#101825'
+GRID_COLOR    = '#1e2d42'
+TEXT_COLOR    = '#c8d6e5'
+ACCENT_CYAN   = '#00d2ff'
+ACCENT_GREEN  = '#00ff88'
+ACCENT_RED    = '#ff3355'
+ACCENT_AMBER  = '#ffaa00'
 ACCENT_MAGENTA = '#ff44cc'
 JAMMER_COLORS = ['#ff3355', '#ff8800', '#ffdd00', '#ff44cc']
 WEIGHT_COLORS = [
@@ -60,12 +75,10 @@ MPL_RC = {
 
 
 def _apply_dark_style() -> None:
-    """Apply the dark engineering theme to matplotlib."""
     plt.rcParams.update(MPL_RC)
 
 
 def _plotly_dark_layout(fig: go.Figure, title: str = '') -> go.Figure:
-    """Apply consistent dark theme to Plotly figures."""
     fig.update_layout(
         template='plotly_dark',
         paper_bgcolor=DARK_BG,
@@ -80,48 +93,34 @@ def _plotly_dark_layout(fig: go.Figure, title: str = '') -> go.Figure:
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Array Geometry Plot
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  ARRAY GEOMETRY PLOT
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_array_geometry(
     positions: NDArray,
     desired_az: float = 0.0,
     jammers: Optional[List[JammerConfig]] = None,
 ) -> Figure:
-    """
-    Plot the array element positions with desired and jammer DOAs.
-
-    Parameters
-    ----------
-    positions  : (N, 3) element coordinates in metres.
-    desired_az : desired signal azimuth (degrees).
-    jammers    : list of JammerConfig for jammer markers.
-
-    Returns
-    -------
-    Matplotlib Figure.
-    """
+    """Plot element positions with desired and jammer DOA arrows."""
     _apply_dark_style()
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
 
-    # Array elements
-    x = positions[:, 0] * 100  # convert to cm
+    x = positions[:, 0] * 100  # cm
     y = positions[:, 1] * 100
     ax.scatter(x, y, s=180, c=ACCENT_CYAN, zorder=5, edgecolors='white',
                linewidths=0.8, marker='h')
     for i in range(len(x)):
-        ax.annotate(f'E{i}', (x[i], y[i]), textcoords="offset points",
+        label = f'★E{i}' if i == 0 else f'E{i}'
+        ax.annotate(label, (x[i], y[i]), textcoords="offset points",
                     xytext=(8, 8), fontsize=9, color=ACCENT_CYAN, fontweight='bold')
 
-    # Radius circle
     r_cm = np.max(np.sqrt(x**2 + y**2))
     if r_cm > 0:
         circle = Circle((0, 0), r_cm, fill=False, edgecolor=GRID_COLOR,
                          linestyle='--', linewidth=1)
         ax.add_patch(circle)
 
-    # Desired signal direction
     arrow_len = r_cm * 1.6 if r_cm > 0 else 15
     az_rad = np.deg2rad(desired_az)
     ax.annotate('', xy=(arrow_len * np.cos(az_rad), arrow_len * np.sin(az_rad)),
@@ -131,7 +130,6 @@ def plot_array_geometry(
             f'Signal\n({desired_az:.0f}°)', color=ACCENT_GREEN, fontsize=9,
             ha='center', va='center', fontweight='bold')
 
-    # Jammer directions
     if jammers:
         for idx, j in enumerate(jammers):
             color = JAMMER_COLORS[idx % len(JAMMER_COLORS)]
@@ -155,9 +153,9 @@ def plot_array_geometry(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# 2D Polar Pattern Plot
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  2D POLAR PATTERN
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_polar_pattern(
     az_deg: NDArray,
@@ -168,45 +166,25 @@ def plot_polar_pattern(
     pattern_db_quant: Optional[NDArray] = None,
     dynamic_range: float = 60.0,
 ) -> Figure:
-    """
-    Polar plot of the azimuthal radiation pattern.
-
-    Parameters
-    ----------
-    az_deg          : (M,) azimuth angles.
-    pattern_db      : (M,) pattern in dB (normalised).
-    desired_az      : desired signal azimuth for marker.
-    jammers         : jammer list for null markers.
-    title           : plot title.
-    pattern_db_quant: optional quantized pattern overlay.
-    dynamic_range   : dB range to display.
-
-    Returns
-    -------
-    Matplotlib Figure.
-    """
+    """Polar radiation pattern with jammer/desired markers."""
     _apply_dark_style()
     fig, ax = plt.subplots(1, 1, figsize=(8, 8), subplot_kw=dict(polar=True))
     ax.set_facecolor(PANEL_BG)
 
     az_rad = np.deg2rad(az_deg)
-
-    # Clamp to dynamic range
     patt_clamped = np.maximum(pattern_db, -dynamic_range)
 
     ax.plot(az_rad, patt_clamped, color=ACCENT_CYAN, linewidth=2.0, label='Ideal Weights')
     ax.fill(az_rad, patt_clamped, alpha=0.08, color=ACCENT_CYAN)
 
     if pattern_db_quant is not None:
-        patt_q_clamped = np.maximum(pattern_db_quant, -dynamic_range)
-        ax.plot(az_rad, patt_q_clamped, color=ACCENT_AMBER, linewidth=1.5,
-                linestyle='--', label='Quantized Weights', alpha=0.85)
+        patt_q = np.maximum(pattern_db_quant, -dynamic_range)
+        ax.plot(az_rad, patt_q, color=ACCENT_AMBER, linewidth=1.5,
+                linestyle='--', label='Quantized', alpha=0.85)
 
-    # Desired signal marker
     ax.axvline(np.deg2rad(desired_az), color=ACCENT_GREEN, linestyle='-',
                linewidth=1.5, alpha=0.7, label=f'Desired ({desired_az:.0f}°)')
 
-    # Jammer markers
     if jammers:
         for idx, j in enumerate(jammers):
             color = JAMMER_COLORS[idx % len(JAMMER_COLORS)]
@@ -226,9 +204,9 @@ def plot_polar_pattern(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# 2D Cartesian Pattern Cut
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  2D CARTESIAN PATTERN
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_cartesian_pattern(
     az_deg: NDArray,
@@ -238,9 +216,7 @@ def plot_cartesian_pattern(
     pattern_db_quant: Optional[NDArray] = None,
     dynamic_range: float = 60.0,
 ) -> Figure:
-    """
-    Cartesian dB plot of the azimuthal pattern for detailed null inspection.
-    """
+    """Cartesian dB plot for detailed null inspection."""
     _apply_dark_style()
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
 
@@ -250,7 +226,7 @@ def plot_cartesian_pattern(
     if pattern_db_quant is not None:
         patt_q = np.maximum(pattern_db_quant, -dynamic_range)
         ax.plot(az_deg, patt_q, color=ACCENT_AMBER, linewidth=1.5,
-                linestyle='--', label='Quantized Weights', alpha=0.85)
+                linestyle='--', label='Quantized', alpha=0.85)
 
     ax.axvline(desired_az, color=ACCENT_GREEN, linestyle='-', linewidth=1.5,
                alpha=0.7, label=f'Desired ({desired_az:.0f}°)')
@@ -272,9 +248,11 @@ def plot_cartesian_pattern(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# 3D Surface Pattern (Plotly)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  3D RADIATION PATTERN (FIXED — NO LONGER FREEZES)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_3D_MAX_VERTICES = 60  # Max grid dimension in either axis
 
 def plot_3d_pattern(
     az_deg: NDArray,
@@ -284,27 +262,32 @@ def plot_3d_pattern(
     title: str = '3D Radiation Pattern',
 ) -> go.Figure:
     """
-    Interactive 3D spherical radiation pattern using Plotly.
+    Interactive 3D hemispherical radiation pattern (Plotly).
 
-    Converts (az, el, gain) to Cartesian for surface rendering.
+    ══════════════════════════════════════════════════════════
+    BUG FIX: Previous version sent full-resolution Surface
+    meshes (e.g. 120×60 = 7,200 vertices) to the browser,
+    causing WebGL to hang Streamlit.
 
-    Parameters
-    ----------
-    az_deg       : (M,) azimuth grid.
-    el_deg       : (P,) elevation grid.
-    pattern_db   : (P, M) normalised pattern.
-    dynamic_range: dB floor for display.
-    title        : figure title.
-
-    Returns
-    -------
-    Plotly Figure.
+    Fix:
+      1. Downsample both grids to max 60×60 = 3,600 vertices
+      2. Use lighter Plotly rendering settings
+      3. Reduce colorbar complexity
+    ══════════════════════════════════════════════════════════
     """
-    AZ, EL = np.meshgrid(az_deg, el_deg)
-    patt = np.maximum(pattern_db, -dynamic_range)
+    # Downsample if too dense
+    n_az_in, n_el_in = len(az_deg), len(el_deg)
+    az_step = max(1, n_az_in // _3D_MAX_VERTICES)
+    el_step = max(1, n_el_in // _3D_MAX_VERTICES)
+    az_dec = az_deg[::az_step]
+    el_dec = el_deg[::el_step]
+    patt_dec = pattern_db[::el_step, ::az_step]
 
-    # Map gain to radius (shift so minimum maps to small positive radius)
-    r = patt + dynamic_range + 5  # ensure all positive
+    AZ, EL = np.meshgrid(az_dec, el_dec)
+    patt = np.maximum(patt_dec, -dynamic_range)
+
+    # Map gain to radius
+    r = patt + dynamic_range + 5
     r = np.maximum(r, 0.5)
 
     az_rad = np.deg2rad(AZ)
@@ -326,11 +309,14 @@ def plot_3d_pattern(
             [1.0, '#ff3355'],
         ],
         colorbar=dict(
-            title=dict(text='dB', font=dict(color=TEXT_COLOR)),
-            tickfont=dict(color=TEXT_COLOR),
+            title=dict(text='dB', font=dict(color=TEXT_COLOR, size=12)),
+            tickfont=dict(color=TEXT_COLOR, size=10),
+            thickness=14,
+            len=0.6,
         ),
         opacity=0.92,
         showscale=True,
+        lighting=dict(ambient=0.5, diffuse=0.6, specular=0.2),
     )])
 
     fig.update_layout(
@@ -345,26 +331,21 @@ def plot_3d_pattern(
         font=dict(color=TEXT_COLOR, family='JetBrains Mono, monospace'),
         title=dict(text=title, font=dict(size=16, color=TEXT_COLOR)),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=600,
+        height=550,
     )
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Weight Vector Visualisation
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  WEIGHT VECTOR VISUALISATION
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_weights(
     w_ideal: NDArray,
     w_quant: Optional[NDArray] = None,
     quant_config: Optional[QuantConfig] = None,
 ) -> Figure:
-    """
-    Visualise complex beamformer weights (magnitude & phase).
-
-    Shows bar charts for amplitude (dB) and phase (degrees) with
-    ideal vs quantized overlays.
-    """
+    """Amplitude and phase bar charts for ideal vs quantized weights."""
     _apply_dark_style()
     n = len(w_ideal)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7))
@@ -372,7 +353,6 @@ def plot_weights(
     x = np.arange(n)
     bar_w = 0.35
 
-    # Amplitude
     mag_ideal = 20 * np.log10(np.abs(w_ideal) / np.max(np.abs(w_ideal)) + 1e-15)
     ax1.bar(x - bar_w / 2, mag_ideal, bar_w, color=ACCENT_CYAN, alpha=0.85,
             label='Ideal', edgecolor='white', linewidth=0.5)
@@ -389,7 +369,6 @@ def plot_weights(
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3, axis='y')
 
-    # Phase
     phase_ideal = np.rad2deg(np.angle(w_ideal))
     ax2.bar(x - bar_w / 2, phase_ideal, bar_w, color=ACCENT_CYAN, alpha=0.85,
             label='Ideal', edgecolor='white', linewidth=0.5)
@@ -416,27 +395,18 @@ def plot_weights(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Wideband Squint Plot
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  WIDEBAND SQUINT PLOT
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_wideband_squint(
     freq_offsets_mhz: NDArray,
-    null_depths: dict[str, NDArray],
+    null_depths: Dict[str, NDArray],
+    stap_depths: Optional[Dict[str, NDArray]] = None,
     title: str = 'Wideband Null Dispersion (Squint)',
 ) -> go.Figure:
     """
-    Plot null depth vs frequency offset for each jammer.
-
-    Parameters
-    ----------
-    freq_offsets_mhz : (K,) offset from centre in MHz.
-    null_depths      : dict mapping jammer label to (K,) null depth in dB.
-    title            : figure title.
-
-    Returns
-    -------
-    Plotly Figure.
+    Plot null depth vs frequency offset, optionally with STAP overlay.
     """
     fig = go.Figure()
 
@@ -444,21 +414,24 @@ def plot_wideband_squint(
     for idx, (label, depth) in enumerate(null_depths.items()):
         color = colors[idx % len(colors)]
         fig.add_trace(go.Scatter(
-            x=freq_offsets_mhz,
-            y=depth,
-            mode='lines+markers',
-            name=label,
+            x=freq_offsets_mhz, y=depth,
+            mode='lines', name=f'{label} (spatial)',
             line=dict(color=color, width=2.5),
-            marker=dict(size=4, color=color),
         ))
 
-    # Reference lines
+    if stap_depths is not None:
+        for idx, (label, depth) in enumerate(stap_depths.items()):
+            color = colors[idx % len(colors)]
+            fig.add_trace(go.Scatter(
+                x=freq_offsets_mhz, y=depth,
+                mode='lines', name=f'{label} (STAP)',
+                line=dict(color=color, width=2, dash='dot'),
+            ))
+
     fig.add_hline(y=-20, line_dash='dot', line_color=ACCENT_GREEN,
-                  annotation_text='-20 dB threshold',
-                  annotation_font_color=ACCENT_GREEN)
+                  annotation_text='-20 dB', annotation_font_color=ACCENT_GREEN)
     fig.add_hline(y=-30, line_dash='dot', line_color=ACCENT_AMBER,
-                  annotation_text='-30 dB threshold',
-                  annotation_font_color=ACCENT_AMBER)
+                  annotation_text='-30 dB', annotation_font_color=ACCENT_AMBER)
     fig.add_vline(x=0, line_dash='solid', line_color=GRID_COLOR, line_width=1)
 
     fig = _plotly_dark_layout(fig, title)
@@ -468,18 +441,15 @@ def plot_wideband_squint(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# S-Parameter / Coupling Matrix Heatmap
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  COUPLING MATRIX HEATMAP
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_coupling_matrix(
     matrix: NDArray,
     title: str = 'Mutual Coupling Matrix |C|',
     show_phase: bool = False,
 ) -> Figure:
-    """
-    Heatmap of the coupling matrix magnitude (or phase).
-    """
     _apply_dark_style()
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
 
@@ -496,7 +466,6 @@ def plot_coupling_matrix(
     ax.set_yticklabels([f'E{i}' for i in range(n)])
     ax.set_title(title, fontsize=14, fontweight='bold')
 
-    # Annotate cells
     for i in range(n):
         for j in range(n):
             val = data[i, j]
@@ -508,9 +477,9 @@ def plot_coupling_matrix(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# AEP Pattern Visualization
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  AEP PATTERN VISUALISATION
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_aep_pattern(
     theta_deg: NDArray,
@@ -518,36 +487,100 @@ def plot_aep_pattern(
     magnitude: NDArray,
     element_index: int = 0,
 ) -> Figure:
-    """
-    2D colour map of an element's Active Element Pattern.
-    """
+    """2D colour map of an element's Active Element Pattern."""
     _apply_dark_style()
     fig, ax = plt.subplots(1, 1, figsize=(9, 5))
 
-    im = ax.pcolormesh(
-        phi_deg, theta_deg, magnitude,
-        cmap='viridis', shading='auto',
-    )
+    im = ax.pcolormesh(phi_deg, theta_deg, magnitude,
+                       cmap='viridis', shading='auto')
     plt.colorbar(im, ax=ax, label='Normalised Gain (linear)')
     ax.set_xlabel('Phi (°)')
     ax.set_ylabel('Theta (°)')
     ax.set_title(f'Active Element Pattern — Element {element_index}',
                  fontsize=14, fontweight='bold')
-    ax.invert_yaxis()  # Theta=0 (zenith) at top
+    ax.invert_yaxis()
     fig.tight_layout()
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Metrics Summary (Plotly Table)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  POLARISATION ANALYSIS PLOTS
+# ═══════════════════════════════════════════════════════════════════════════
 
-def create_metrics_table(
-    metrics: dict[str, str],
-) -> go.Figure:
-    """
-    Compact metrics table rendered as a Plotly table for dark dashboards.
-    """
+def plot_polarisation_response(
+    az_deg: NDArray,
+    co_pol_db: NDArray,
+    cross_pol_db: NDArray,
+    xpd_db: NDArray,
+    dynamic_range: float = 60.0,
+) -> Figure:
+    """Co-pol / cross-pol / XPD pattern overlay."""
+    _apply_dark_style()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    co_clamped = np.maximum(co_pol_db, -dynamic_range)
+    cross_clamped = np.maximum(cross_pol_db, -dynamic_range)
+
+    ax1.plot(az_deg, co_clamped, color=ACCENT_CYAN, linewidth=2, label='Co-Pol (RHCP)')
+    ax1.plot(az_deg, cross_clamped, color=ACCENT_RED, linewidth=1.5,
+             linestyle='--', label='Cross-Pol (LHCP)')
+    ax1.set_ylabel('Normalised Gain (dB)')
+    ax1.set_title('Polarisation Response', fontsize=14, fontweight='bold')
+    ax1.set_ylim(-dynamic_range, 5)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(az_deg, xpd_db, color=ACCENT_GREEN, linewidth=2)
+    ax2.set_xlabel('Azimuth (°)')
+    ax2.set_ylabel('XPD (dB)')
+    ax2.set_title('Cross-Polarisation Discrimination', fontsize=14, fontweight='bold')
+    ax2.axhline(y=15, color=ACCENT_AMBER, linestyle=':', alpha=0.7, label='15 dB threshold')
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STAP VISUALISATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plot_stap_weights(
+    w_stap: NDArray,
+    n_elements: int,
+    n_taps: int,
+) -> Figure:
+    """Visualise STAP weight matrix (elements × taps) as a heatmap."""
+    _apply_dark_style()
+    W = w_stap.reshape(n_elements, n_taps)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    im1 = ax1.imshow(20 * np.log10(np.abs(W) + 1e-15), cmap='inferno',
+                     aspect='auto', interpolation='nearest')
+    plt.colorbar(im1, ax=ax1, label='|w| (dB)')
+    ax1.set_xlabel('Tap Index')
+    ax1.set_ylabel('Element Index')
+    ax1.set_title('STAP Weight Magnitudes', fontsize=13, fontweight='bold')
+
+    im2 = ax2.imshow(np.angle(W, deg=True), cmap='twilight',
+                     aspect='auto', interpolation='nearest')
+    plt.colorbar(im2, ax=ax2, label='Phase (°)')
+    ax2.set_xlabel('Tap Index')
+    ax2.set_ylabel('Element Index')
+    ax2.set_title('STAP Weight Phases', fontsize=13, fontweight='bold')
+
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  METRICS TABLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def create_metrics_table(metrics: Dict[str, str]) -> go.Figure:
+    """Compact dark-theme metrics table (Plotly)."""
     fig = go.Figure(data=[go.Table(
         header=dict(
             values=['<b>Parameter</b>', '<b>Value</b>'],

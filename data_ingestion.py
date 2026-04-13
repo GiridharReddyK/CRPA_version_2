@@ -1,11 +1,13 @@
 """
-data_ingestion.py — Active Element Pattern (AEP) Ingestion & Interpolation
+data_ingestion.py — Active Element Pattern & External Data Ingestion
+====================================================================
 
-Provides:
-- Mock AEP generation simulating HFSS/CST 3D radiation pattern exports
-  with realistic edge diffraction effects on a ground plane.
-- CSV parser for real measured/simulated AEP data files.
-- RectBivariateSpline interpolation for fast per-element pattern lookup.
+Production-grade data pipeline for:
+  - Mock AEP generation (Huygens-source model with edge diffraction)
+  - HFSS / CST CSV pattern import
+  - Touchstone (.sNp) S-parameter file parsing via scikit-rf
+  - Arbitrary XYZ geometry import
+  - RectBivariateSpline interpolation for fast per-element lookup
 
 Data format convention (HFSS-style):
     Theta [deg] | Phi [deg] | Mag [dB or linear] | Phase [deg]
@@ -23,6 +25,10 @@ from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  AEP DATA CONTAINER
+# ═══════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class AEPData:
     """Container for a single element's Active Element Pattern."""
@@ -32,6 +38,10 @@ class AEPData:
     phase_deg: NDArray      # (N_theta, N_phi) phase in degrees
     element_index: int = 0
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MOCK AEP GENERATION
+# ═══════════════════════════════════════════════════════════════════════════
 
 def generate_mock_aep(
     element_index: int,
@@ -44,25 +54,11 @@ def generate_mock_aep(
     """
     Generate a physically motivated mock AEP for a single element.
 
-    This replaces the naive cos^1.5(theta) approximation with a more
-    realistic pattern that includes:
-    - Hemispherical rolloff with ground-plane backing
-    - Edge diffraction ripple (Fresnel-zone modulation)
-    - Azimuthal asymmetry from element placement on a finite ground plane
-    - Element-to-element variation (each element has a unique pattern)
-
-    Parameters
-    ----------
-    element_index    : index of this element in the array.
-    n_elements       : total number of elements (for placement geometry).
-    theta_resolution : grid step in theta (degrees).
-    phi_resolution   : grid step in phi (degrees).
-    ground_plane     : if True, enforce near-zero gain below horizon.
-    seed             : RNG seed for reproducible patterns.
-
-    Returns
-    -------
-    AEPData with the interpolatable pattern.
+    Uses a Huygens-source model G(θ)∝(1+cosθ)/2 with:
+      - Hemispherical rolloff with ground-plane backing
+      - Edge diffraction ripple (Fresnel-zone modulation)
+      - Azimuthal asymmetry from off-centre element placement
+      - Element-to-element variation
     """
     rng = np.random.default_rng(seed if seed is not None else 1000 + element_index)
 
@@ -72,51 +68,38 @@ def generate_mock_aep(
     theta_rad = np.deg2rad(THETA)
     phi_rad = np.deg2rad(PHI)
 
-    # --- Base pattern: patch-like element on ground plane ---
-    # Smooth hemispherical rolloff (NOT cos^1.5)
-    # Use a physically motivated Huygens-source model:
-    #   G(θ) ∝ (1 + cos θ) / 2   for θ < 90°
+    # Base: Huygens source (NOT cos^1.5)
     base = np.where(
         THETA <= 90,
         (1.0 + np.cos(theta_rad)) / 2.0,
         0.0
     )
 
-    # --- Edge diffraction ripple ---
-    # Simulates Fresnel diffraction from finite ground plane edges.
-    # The ripple period depends on ground plane size; here we use
-    # a characteristic 15° period with element-dependent phase offset.
-    ripple_period = 12.0 + 6.0 * rng.random()  # degrees
+    # Edge diffraction ripple
+    ripple_period = 12.0 + 6.0 * rng.random()
     ripple_phase = 2.0 * np.pi * element_index / max(n_elements, 1)
     diffraction = 1.0 + 0.12 * np.sin(
         2.0 * np.pi * THETA / ripple_period + ripple_phase
     )
 
-    # --- Azimuthal asymmetry ---
-    # Off-centre elements see asymmetric ground plane edges.
+    # Azimuthal asymmetry
     if element_index > 0 and n_elements > 1:
         asym_angle = 2.0 * np.pi * (element_index - 1) / (n_elements - 1)
         asymmetry = 1.0 + 0.08 * np.cos(phi_rad - asym_angle) * np.sin(theta_rad)
     else:
-        # Centre element: nearly symmetric
         asymmetry = 1.0 + 0.02 * np.cos(2 * phi_rad) * np.sin(theta_rad)
 
-    # --- Combine ---
     magnitude = base * diffraction * asymmetry
 
-    # Ground plane suppression: steep rolloff below horizon
     if ground_plane:
         horizon_mask = np.exp(-((THETA - 90.0) / 8.0) ** 2)
-        below_horizon = THETA > 90
-        magnitude[below_horizon] *= horizon_mask[below_horizon] * 0.05
+        below = THETA > 90
+        magnitude[below] *= horizon_mask[below] * 0.05
 
-    # Normalise peak to unity
     mag_max = np.max(magnitude)
     if mag_max > 0:
         magnitude /= mag_max
 
-    # --- Phase pattern ---
-    # Smooth phase variation across the hemisphere
     phase = (
         30.0 * np.sin(theta_rad) * np.cos(phi_rad - ripple_phase)
         + 10.0 * rng.standard_normal(THETA.shape)
@@ -131,6 +114,10 @@ def generate_mock_aep(
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CSV / DATAFRAME PARSERS
+# ═══════════════════════════════════════════════════════════════════════════
+
 def parse_hfss_csv(
     filepath: str,
     element_index: int = 0,
@@ -140,40 +127,17 @@ def parse_hfss_csv(
     phi_column: str = 'Phi',
     mag_in_db: bool = True,
 ) -> AEPData:
-    """
-    Parse an HFSS/CST-style CSV export into an AEPData object.
-
-    Expected CSV columns: Theta, Phi, Mag (dB or linear), Phase (degrees).
-
-    Parameters
-    ----------
-    filepath      : path to the CSV file.
-    element_index : which element this pattern belongs to.
-    mag_column    : column name for magnitude data.
-    phase_column  : column name for phase data.
-    theta_column  : column name for theta angles.
-    phi_column    : column name for phi angles.
-    mag_in_db     : if True, convert from dB to linear voltage.
-
-    Returns
-    -------
-    AEPData with regular grid (interpolated if input is irregular).
-    """
+    """Parse an HFSS/CST-style CSV export into AEPData."""
     df = pd.read_csv(filepath)
-
-    # Clean column names
     df.columns = df.columns.str.strip()
 
     theta_vals = np.sort(df[theta_column].unique())
     phi_vals = np.sort(df[phi_column].unique())
-
-    n_theta = len(theta_vals)
-    n_phi = len(phi_vals)
+    n_theta, n_phi = len(theta_vals), len(phi_vals)
 
     mag_grid = np.zeros((n_theta, n_phi))
     phase_grid = np.zeros((n_theta, n_phi))
 
-    # Pivot into regular grid
     for _, row in df.iterrows():
         ti = np.searchsorted(theta_vals, row[theta_column])
         pi = np.searchsorted(phi_vals, row[phi_column])
@@ -185,10 +149,8 @@ def parse_hfss_csv(
             phase_grid[ti, pi] = row[phase_column]
 
     return AEPData(
-        theta_deg=theta_vals,
-        phi_deg=phi_vals,
-        magnitude=mag_grid,
-        phase_deg=phase_grid,
+        theta_deg=theta_vals, phi_deg=phi_vals,
+        magnitude=mag_grid, phase_deg=phase_grid,
         element_index=element_index,
     )
 
@@ -198,27 +160,10 @@ def parse_aep_dataframe(
     element_index: int = 0,
     mag_in_db: bool = True,
 ) -> AEPData:
-    """
-    Parse a DataFrame with columns [Theta, Phi, Mag, Phase] into AEPData.
-
-    This is the generic ingestion interface — any tool chain that can
-    produce a DataFrame in this format can feed the simulator.
-
-    Parameters
-    ----------
-    df            : DataFrame with columns Theta, Phi, Mag, Phase.
-    element_index : element index for labelling.
-    mag_in_db     : whether Mag column is in dB.
-
-    Returns
-    -------
-    AEPData on a regular (theta, phi) grid.
-    """
+    """Parse a DataFrame with columns [Theta, Phi, Mag, Phase]."""
     theta_vals = np.sort(df['Theta'].unique())
     phi_vals = np.sort(df['Phi'].unique())
-
-    n_theta = len(theta_vals)
-    n_phi = len(phi_vals)
+    n_theta, n_phi = len(theta_vals), len(phi_vals)
 
     mag_grid = np.full((n_theta, n_phi), np.nan)
     phase_grid = np.full((n_theta, n_phi), np.nan)
@@ -236,46 +181,29 @@ def parse_aep_dataframe(
             mag_grid[ti, pi] = mag_val
             phase_grid[ti, pi] = row['Phase']
 
-    # Fill any NaN gaps with nearest-neighbour
-    from scipy.ndimage import generic_filter
     mask = np.isnan(mag_grid)
     if mask.any():
         mag_grid[mask] = 0.0
         phase_grid[mask] = 0.0
 
     return AEPData(
-        theta_deg=theta_vals,
-        phi_deg=phi_vals,
-        magnitude=mag_grid,
-        phase_deg=phase_grid,
+        theta_deg=theta_vals, phi_deg=phi_vals,
+        magnitude=mag_grid, phase_deg=phase_grid,
         element_index=element_index,
     )
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  INTERPOLATOR
+# ═══════════════════════════════════════════════════════════════════════════
 
 def build_aep_interpolator(
     aep: AEPData,
     smoothing: float = 0.0,
 ) -> RectBivariateSpline:
-    """
-    Build a fast 2D spline interpolator for the element's magnitude pattern.
-
-    Uses scipy.interpolate.RectBivariateSpline for O(1) lookup at
-    arbitrary (theta, phi) query points.
-
-    Parameters
-    ----------
-    aep       : AEPData with regular grid data.
-    smoothing : spline smoothing factor (0 = interpolating).
-
-    Returns
-    -------
-    RectBivariateSpline callable: interp(theta, phi) → magnitude.
-    """
+    """Fast 2D spline interpolator for element pattern lookup."""
     return RectBivariateSpline(
-        aep.theta_deg,
-        aep.phi_deg,
-        aep.magnitude,
-        s=smoothing,
+        aep.theta_deg, aep.phi_deg, aep.magnitude, s=smoothing,
     )
 
 
@@ -284,20 +212,7 @@ def generate_all_element_aeps(
     theta_res: float = 2.0,
     phi_res: float = 2.0,
 ) -> Tuple[List[AEPData], List[RectBivariateSpline]]:
-    """
-    Generate mock AEPs and interpolators for all elements in the array.
-
-    Parameters
-    ----------
-    n_elements : number of array elements.
-    theta_res  : theta grid resolution (degrees).
-    phi_res    : phi grid resolution (degrees).
-
-    Returns
-    -------
-    aeps          : list of AEPData objects.
-    interpolators : list of RectBivariateSpline objects.
-    """
+    """Generate mock AEPs and interpolators for all elements."""
     aeps = []
     interpolators = []
     for i in range(n_elements):
@@ -305,3 +220,23 @@ def generate_all_element_aeps(
         aeps.append(aep)
         interpolators.append(build_aep_interpolator(aep))
     return aeps, interpolators
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GEOMETRY IMPORT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_xyz_geometry(filepath: str) -> NDArray:
+    """
+    Load arbitrary element positions from a CSV/text file.
+
+    Expected format: X, Y, Z columns in metres (one row per element).
+    """
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip().str.upper()
+    return df[['X', 'Y', 'Z']].values.astype(float)
+
+
+def load_xyz_from_array(positions: list[list[float]]) -> NDArray:
+    """Convert a list of [x, y, z] coordinates to a positions matrix."""
+    return np.array(positions, dtype=float)

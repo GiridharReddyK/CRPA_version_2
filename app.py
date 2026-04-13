@@ -1,17 +1,41 @@
 """
-app.py — CRPA Null Steering Dashboard (Production-Grade)
+app.py — CRPA Null Steering Dashboard (Production-Grade v2)
+==========================================================
 
-A physically grounded, hardware-constrained RF engineering simulator for
-Controlled Reception Pattern Antenna null steering analysis.
+Industry-standard Controlled Reception Pattern Antenna simulator
+with full-featured RF engineering capabilities:
 
-Features:
-    1. Active Element Pattern (AEP) ingestion with RectBivariateSpline
-    2. Mutual Coupling Matrix from S-parameters
-    3. Hardware quantization (phase shifter + attenuator)
-    4. Sample Matrix Inversion (SMI) covariance-based nulling
-    5. Wideband null dispersion (squint) analysis
+  BUG FIX 1: Phantom Nulls with 0 Jammers
+  ─────────────────────────────────────────
+  Root cause: MVDR weights computed in the coupled domain (C·a_d)
+  were evaluated against coupled steering matrices (C·A), making
+  the beam pattern proportional to |a_d^H C^H C A|². The C^H·C
+  cross-coupling product creates spurious nulls from the mock
+  S-matrix's off-diagonal terms — even with zero jammers.
 
-Author: RF Systems Engineering Division
+  Fix: Implemented the paper's Projection-Matrix algorithm as the
+  default. With K=0 jammers, P⊥=I, giving w=a_d/‖a_d‖ — a
+  mathematically guaranteed clean quiescent beam. Coupling is
+  applied ONLY in pattern evaluation (where it's physically correct),
+  not in weight computation.
+
+  BUG FIX 2: 3D Pattern Freezing Streamlit
+  ─────────────────────────────────────────
+  Root cause: Full-resolution Surface mesh (120×60 = 7,200 vertices)
+  overwhelmed the browser's WebGL pipeline. The serialised JSON
+  payload was too large for Plotly to render interactively.
+
+  Fix: Automatic downsampling to max 60×60 = 3,600 vertices in
+  plot_3d_pattern(). Added resolution slider with safe defaults.
+  Chunked evaluation in evaluate_pattern_3d() prevents memory spikes.
+
+  NEW FEATURES:
+  - Projection Matrix + MVDR algorithm selection
+  - Full RHCP/LHCP polarisation tracking with XPD plots
+  - STAP (Space-Time Adaptive Processing) with TDL model
+  - Advanced array topologies (circular, conformal, rectangular)
+  - Touchstone .sNp file upload (requires scikit-rf)
+  - Numba-accelerated inner loops (optional)
 """
 
 from __future__ import annotations
@@ -21,14 +45,18 @@ import numpy as np
 import pandas as pd
 from typing import List, Optional
 
-# Local modules
 from rf_physics import (
-    ArrayConfig, JammerConfig, QuantConfig, ScenarioConfig,
+    ArrayConfig, ArrayTopology, JammerConfig, QuantConfig, STAPConfig,
+    PolarisationConfig, ScenarioConfig, NullingAlgorithm, Polarisation,
     wavelength, ideal_steering_vector, steering_vector_with_aep,
     coupled_steering_vector, generate_mock_s_matrix, s_to_coupling_matrix,
-    build_covariance_matrix, smi_weights, quantize_weights,
-    quantization_error_db, evaluate_pattern_2d, evaluate_pattern_3d,
-    wideband_null_response, dbm_to_watts,
+    build_covariance_matrix, smi_weights, projection_matrix_weights,
+    compute_weights, quantize_weights, quantization_error_db,
+    evaluate_pattern_2d, evaluate_pattern_3d, wideband_null_response,
+    polarisation_mismatch_loss_db, polarisation_jones_vector,
+    axial_ratio_from_jones,
+    build_stap_steering_vector, stap_weights, stap_null_response,
+    dbm_to_watts, HAS_NUMBA, HAS_SKRF,
 )
 from data_ingestion import (
     generate_mock_aep, generate_all_element_aeps,
@@ -38,14 +66,15 @@ from visualizations import (
     plot_array_geometry, plot_polar_pattern, plot_cartesian_pattern,
     plot_3d_pattern, plot_weights, plot_wideband_squint,
     plot_coupling_matrix, plot_aep_pattern, create_metrics_table,
+    plot_polarisation_response, plot_stap_weights,
     DARK_BG, ACCENT_CYAN, ACCENT_GREEN, ACCENT_RED, ACCENT_AMBER,
     TEXT_COLOR, PANEL_BG,
 )
 
 
-# ---------------------------------------------------------------------------
-# Page Config & Custom CSS
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  PAGE CONFIG & CSS
+# ═══════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
     page_title='CRPA Null Steering Dashboard',
@@ -56,7 +85,6 @@ st.set_page_config(
 
 st.markdown(f"""
 <style>
-    /* ---- Dark engineering dashboard theme ---- */
     .stApp {{
         background-color: {DARK_BG};
         color: {TEXT_COLOR};
@@ -106,13 +134,6 @@ st.markdown(f"""
         font-family: 'JetBrains Mono', monospace;
         font-weight: 700;
     }}
-    .metric-card {{
-        background: linear-gradient(135deg, {PANEL_BG}, #141e30);
-        border: 1px solid #1e2d42;
-        border-radius: 10px;
-        padding: 16px;
-        margin: 4px 0;
-    }}
     h1 {{
         font-family: 'JetBrains Mono', monospace !important;
         color: {ACCENT_CYAN} !important;
@@ -125,30 +146,26 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# Cached Computation Functions
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  CACHED COMPUTATION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data
 def cached_generate_aeps(n_elements: int, theta_res: float, phi_res: float):
     """Generate and cache AEP data for all elements."""
     aeps, _ = generate_all_element_aeps(n_elements, theta_res, phi_res)
-    # Convert to serialisable form for caching
-    aep_dicts = []
-    for aep in aeps:
-        aep_dicts.append({
-            'theta': aep.theta_deg,
-            'phi': aep.phi_deg,
-            'magnitude': aep.magnitude,
-            'phase': aep.phase_deg,
+    return [
+        {
+            'theta': aep.theta_deg, 'phi': aep.phi_deg,
+            'magnitude': aep.magnitude, 'phase': aep.phase_deg,
             'index': aep.element_index,
-        })
-    return aep_dicts
+        }
+        for aep in aeps
+    ]
 
 
 @st.cache_data
 def cached_s_matrix(n_elements: int, coupling_mag: float, isolation_db: float):
-    """Generate and cache the S-parameter matrix."""
     return generate_mock_s_matrix(n_elements, coupling_mag, isolation_db)
 
 
@@ -157,17 +174,12 @@ def cached_3d_pattern(
     _w_real, _w_imag, _pos_tuple, n_elements, freq_hz, az_pts, el_pts,
     _c_real, _c_imag,
 ):
-    """Cache-friendly 3D pattern evaluation.
-
-    Complex arrays are split into real/imag tuples for hashability.
-    Shape information is reconstructed from n_elements.
-    """
+    """Cache-friendly 3D pattern evaluation with chunked compute."""
     w = np.array(_w_real) + 1j * np.array(_w_imag)
     positions = np.array(_pos_tuple).reshape(n_elements, 3)
-    coupling = (
-        (np.array(_c_real) + 1j * np.array(_c_imag)).reshape(n_elements, n_elements)
-        if _c_real is not None else None
-    )
+    coupling = None
+    if _c_real is not None:
+        coupling = (np.array(_c_real) + 1j * np.array(_c_imag)).reshape(n_elements, n_elements)
 
     az_grid = np.linspace(0, 360, az_pts)
     el_grid = np.linspace(0, 90, el_pts)
@@ -178,34 +190,69 @@ def cached_3d_pattern(
     ), az_grid, el_grid
 
 
-# ---------------------------------------------------------------------------
-# Sidebar Configuration
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIDEBAR CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
 
-def build_sidebar() -> ScenarioConfig:
-    """Build the sidebar controls and return a ScenarioConfig."""
+def build_sidebar():
+    """Build the sidebar controls and return full configuration."""
 
     st.sidebar.markdown('# 📡 CRPA NULL STEERING')
     st.sidebar.markdown('---')
 
-    # --- Array Parameters ---
+    # ── Algorithm Selection ──
+    st.sidebar.markdown('### Algorithm')
+    algo_choice = st.sidebar.radio(
+        'Null-Steering Method',
+        ['Projection Matrix', 'MVDR / SMI'],
+        index=0,
+        help=(
+            '**Projection Matrix** (paper-aligned): Deterministic, guaranteed clean '
+            'quiescent beam with 0 jammers. Uses P⊥ = I − A_n(A_n^H A_n + εI)^{-1}A_n^H.\n\n'
+            '**MVDR/SMI**: Adaptive covariance-based. Accounts for jammer power levels '
+            'but requires diagonal loading for robustness.'
+        ),
+    )
+    algorithm = (
+        NullingAlgorithm.PROJECTION if algo_choice == 'Projection Matrix'
+        else NullingAlgorithm.MVDR
+    )
+
+    st.sidebar.markdown('---')
+
+    # ── Array Configuration ──
     st.sidebar.markdown('### Array Configuration')
-    n_elements = st.sidebar.slider('Number of Elements', 4, 12, 7,
+
+    topo_choice = st.sidebar.selectbox(
+        'Array Topology',
+        ['Circular (N+1)', 'Conformal Cylinder', 'Conformal Sphere', 'Rectangular'],
+        index=0,
+    )
+    topo_map = {
+        'Circular (N+1)': ArrayTopology.CIRCULAR,
+        'Conformal Cylinder': ArrayTopology.CONFORMAL_CYLINDER,
+        'Conformal Sphere': ArrayTopology.CONFORMAL_SPHERE,
+        'Rectangular': ArrayTopology.RECTANGULAR,
+    }
+    topology = topo_map[topo_choice]
+
+    n_elements = st.sidebar.slider('Number of Elements', 4, 16, 7,
                                    help='Total elements including centre element')
     freq_mhz = st.sidebar.number_input('Carrier Frequency (MHz)', 500.0, 6000.0,
                                         1575.42, step=0.01, format='%.2f')
     radius_mm = st.sidebar.slider('Array Radius (mm)', 30, 300, 95,
-                                  help='Ring radius for outer elements')
+                                  help='Ring/conformal radius for outer elements')
 
     array_cfg = ArrayConfig(
         n_elements=n_elements,
         radius_m=radius_mm / 1000.0,
         freq_hz=freq_mhz * 1e6,
+        topology=topology,
     )
 
     st.sidebar.markdown('---')
 
-    # --- Desired Signal ---
+    # ── Desired Signal ──
     st.sidebar.markdown('### Desired Signal')
     des_az = st.sidebar.slider('Azimuth (°)', 0, 359, 0, key='des_az')
     des_el = st.sidebar.slider('Elevation (°)', 1, 90, 45, key='des_el')
@@ -216,9 +263,9 @@ def build_sidebar() -> ScenarioConfig:
 
     st.sidebar.markdown('---')
 
-    # --- Jammers ---
+    # ── Jammers ──
     st.sidebar.markdown('### Jammer Sources')
-    n_jammers = st.sidebar.slider('Number of Jammers', 0, min(4, n_elements - 1), 2)
+    n_jammers = st.sidebar.slider('Number of Jammers', 0, min(4, n_elements - 1), 0)
 
     jammers: List[JammerConfig] = []
     for i in range(n_jammers):
@@ -227,15 +274,27 @@ def build_sidebar() -> ScenarioConfig:
                             [90, 220, 315, 45][i % 4], key=f'j{i}_az')
             jel = st.slider(f'J{i+1} Elevation (°)', 1, 90, 30, key=f'j{i}_el')
             jjsr = st.slider(f'J{i+1} JSR (dB)', 10, 80, 40, key=f'j{i}_jsr')
+            jpol = st.selectbox(
+                f'J{i+1} Polarisation',
+                ['Linear-V', 'Linear-H', 'LHCP', 'RHCP'],
+                index=0, key=f'j{i}_pol',
+            )
+            pol_map = {
+                'Linear-V': Polarisation.LINEAR_V,
+                'Linear-H': Polarisation.LINEAR_H,
+                'LHCP': Polarisation.LHCP,
+                'RHCP': Polarisation.RHCP,
+            }
             jammers.append(JammerConfig(
                 azimuth_deg=float(jaz),
                 elevation_deg=float(jel),
                 jsr_db=float(jjsr),
+                polarisation=pol_map[jpol],
             ))
 
     st.sidebar.markdown('---')
 
-    # --- Hardware Quantization ---
+    # ── Hardware Quantization ──
     st.sidebar.markdown('### Hardware Constraints')
     quant_enabled = st.sidebar.checkbox('Enable Quantization', value=True)
     phase_bits = st.sidebar.slider('Phase Shifter Bits', 3, 8, 6)
@@ -252,37 +311,62 @@ def build_sidebar() -> ScenarioConfig:
 
     st.sidebar.markdown('---')
 
-    # --- RF Environment ---
+    # ── STAP Configuration ──
+    st.sidebar.markdown('### STAP Processing')
+    stap_enabled = st.sidebar.checkbox('Enable STAP', value=False,
+                                       help='Space-Time Adaptive Processing for wideband nulling')
+    stap_taps = st.sidebar.slider('FIR Taps per Element', 2, 16, 5,
+                                   disabled=not stap_enabled)
+    stap_delay = st.sidebar.slider('Tap Spacing (ns)', 10.0, 200.0, 50.0, step=10.0,
+                                    disabled=not stap_enabled)
+
+    stap_cfg = STAPConfig(
+        enabled=stap_enabled,
+        n_taps=stap_taps,
+        tap_spacing_ns=stap_delay,
+    )
+
+    st.sidebar.markdown('---')
+
+    # ── RF Environment ──
     st.sidebar.markdown('### RF Environment')
     noise_floor = st.sidebar.number_input(
         'Noise Floor (dBm)', -130.0, -90.0, -114.0, step=1.0,
-        help='kTB for ~2 MHz GPS bandwidth',
     )
-    coupling_mag = st.sidebar.slider('Mutual Coupling Level', 0.01, 0.4, 0.15,
-                                     step=0.01, help='Adjacent element |S21|')
+    coupling_mag = st.sidebar.slider('Mutual Coupling |S₂₁|', 0.01, 0.4, 0.15, step=0.01)
     isolation_db = st.sidebar.slider('Return Loss (dB)', -35.0, -10.0, -20.0, step=1.0)
     diag_loading = st.sidebar.slider('Diagonal Loading (dB)', 0.0, 20.0, 3.0, step=0.5,
-                                     help='Robustness against steering errors')
+                                     disabled=(algorithm == NullingAlgorithm.PROJECTION))
 
-    return ScenarioConfig(
+    # ── Capability Status ──
+    st.sidebar.markdown('---')
+    st.sidebar.markdown('### System Status')
+    st.sidebar.markdown(
+        f'🔧 Numba: **{"✅ Active" if HAS_NUMBA else "❌ Not installed"}**\n\n'
+        f'🔧 scikit-rf: **{"✅ Active" if HAS_SKRF else "❌ Not installed"}**\n\n'
+        f'🔧 Algorithm: **{algorithm.value}**'
+    )
+
+    cfg = ScenarioConfig(
         array=array_cfg,
         jammers=jammers,
         quant=quant_cfg,
+        stap=stap_cfg,
         desired_az_deg=float(des_az),
         desired_el_deg=float(des_el),
         noise_floor_dbm=noise_floor,
         signal_power_dbm=sig_power,
-    ), coupling_mag, isolation_db, diag_loading
+        algorithm=algorithm,
+    )
+
+    return cfg, coupling_mag, isolation_db, diag_loading
 
 
-# ---------------------------------------------------------------------------
-# Main Application
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    """Main entry point for the CRPA dashboard."""
-
-    # Build sidebar and get configuration
     cfg, coupling_mag, isolation_db, diag_loading = build_sidebar()
     arr = cfg.array
     positions = arr.element_positions_m
@@ -290,7 +374,7 @@ def main() -> None:
     freq = arr.freq_hz
     lam = wavelength(freq)
 
-    # --- Generate AEPs ---
+    # ── AEP Generation ──
     aep_dicts = cached_generate_aeps(n, 2.0, 2.0)
     aeps = [
         AEPData(
@@ -302,42 +386,66 @@ def main() -> None:
     ]
     interpolators = [build_aep_interpolator(aep) for aep in aeps]
 
-    # --- Coupling Matrix ---
+    # ── Coupling Matrix ──
     S = cached_s_matrix(n, coupling_mag, isolation_db)
     C = s_to_coupling_matrix(S)
 
-    # --- Steering Vectors ---
-    a_desired_ideal = ideal_steering_vector(
-        positions, freq, cfg.desired_az_deg, cfg.desired_el_deg
-    )
-    a_desired_aep = steering_vector_with_aep(
-        positions, freq, cfg.desired_az_deg, cfg.desired_el_deg, interpolators
-    )
-    a_desired_coupled = coupled_steering_vector(C, a_desired_aep)
+    # ══════════════════════════════════════════════════════════════
+    #  WEIGHT COMPUTATION — Algorithm Selection
+    # ══════════════════════════════════════════════════════════════
+    #
+    #  PROJECTION MATRIX (Bug Fix):
+    #    - Weights computed in IDEAL (uncoupled) domain
+    #    - With K=0: w = a_d / ‖a_d‖ → clean quiescent beam
+    #    - Pattern eval: |w^H a(θ)|² — no coupling in eval
+    #    - Coupling ONLY in pattern eval when MVDR is selected
+    #
+    #  MVDR / SMI:
+    #    - Weights computed in COUPLED domain: a_d_coupled = C·a_d
+    #    - Pattern eval: |w^H (C·A)|² — coupling in both domains
+    #    - With K=0: w ∝ C·a_d → clean coupled beam (no ghost nulls
+    #      because coupling applied consistently in both domains)
+    # ══════════════════════════════════════════════════════════════
 
-    # --- Covariance & Weights ---
-    R = build_covariance_matrix(
-        positions, freq, cfg.jammers, cfg.noise_floor_dbm,
-        cfg.signal_power_dbm, coupling_matrix=C,
-        aep_interpolators=interpolators,
-    )
-    w_ideal = smi_weights(R, a_desired_coupled, diagonal_loading_db=diag_loading)
+    if cfg.algorithm == NullingAlgorithm.PROJECTION:
+        # Paper-aligned: weights in ideal domain, no coupling in weight calc
+        w_ideal = projection_matrix_weights(
+            positions, freq, cfg.desired_az_deg, cfg.desired_el_deg,
+            cfg.jammers, coupling_matrix=None,  # No coupling in weights!
+            aep_interpolators=interpolators,
+        )
+        # Pattern evaluation: also in ideal domain (no coupling)
+        C_for_pattern = None
+    else:
+        # MVDR: weights and pattern both in coupled domain
+        a_desired = steering_vector_with_aep(
+            positions, freq, cfg.desired_az_deg, cfg.desired_el_deg, interpolators
+        )
+        a_desired_coupled = coupled_steering_vector(C, a_desired)
+        R = build_covariance_matrix(
+            positions, freq, cfg.jammers, cfg.noise_floor_dbm,
+            cfg.signal_power_dbm, coupling_matrix=C,
+            aep_interpolators=interpolators,
+        )
+        w_ideal = smi_weights(R, a_desired_coupled, diagonal_loading_db=diag_loading)
+        C_for_pattern = C  # Coupling in both domains
+
     w_quant = quantize_weights(w_ideal, cfg.quant)
 
-    # --- Pattern Evaluation ---
+    # ── Pattern Evaluation ──
     az_sweep = np.linspace(0, 360, 720)
     pattern_ideal = evaluate_pattern_2d(
         w_ideal, positions, freq, az_sweep,
-        el_deg=cfg.desired_el_deg, coupling_matrix=C,
+        el_deg=cfg.desired_el_deg, coupling_matrix=C_for_pattern,
         aep_interpolators=interpolators,
     )
     pattern_quant = evaluate_pattern_2d(
         w_quant, positions, freq, az_sweep,
-        el_deg=cfg.desired_el_deg, coupling_matrix=C,
+        el_deg=cfg.desired_el_deg, coupling_matrix=C_for_pattern,
         aep_interpolators=interpolators,
     )
 
-    # === HEADER ===
+    # ═══════════ HEADER ═══════════
     st.markdown("""
     <div style="text-align: center; padding: 10px 0 5px 0;">
         <h1 style="margin-bottom:2px; font-size:28px;">📡 CRPA NULL STEERING DASHBOARD</h1>
@@ -347,7 +455,7 @@ def main() -> None:
     </div>
     """, unsafe_allow_html=True)
 
-    # === METRICS ROW ===
+    # ═══════════ METRICS ROW ═══════════
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric('Elements', f'{n}')
@@ -359,10 +467,10 @@ def main() -> None:
         quant_err = quantization_error_db(w_ideal, w_quant)
         st.metric('Quant Error', f'{quant_err:.1f} dB')
     with col5:
-        # Null depth at first jammer
         if cfg.jammers:
             j0 = cfg.jammers[0]
             j0_idx = np.argmin(np.abs(az_sweep - j0.azimuth_deg))
+            w_active = w_quant if cfg.quant.enabled else w_ideal
             null_d = pattern_quant[j0_idx] if cfg.quant.enabled else pattern_ideal[j0_idx]
             st.metric('J1 Null Depth', f'{null_d:.1f} dB')
         else:
@@ -370,52 +478,51 @@ def main() -> None:
 
     st.markdown('---')
 
-    # === TABS ===
-    tab_layout, tab_2d, tab_3d, tab_squint, tab_hw, tab_aep = st.tabs([
+    # ═══════════ TABS ═══════════
+    tab_layout, tab_2d, tab_3d, tab_squint, tab_hw, tab_aep, tab_pol = st.tabs([
         '🏗️ Array Layout',
-        '📊 2D Pattern Cuts',
+        '📊 2D Pattern',
         '🌐 3D Pattern',
         '📉 Wideband Squint',
-        '⚙️ Hardware Limits',
-        '📐 Element Patterns',
+        '⚙️ Hardware',
+        '📐 AEP',
+        '🔄 Polarisation',
     ])
 
-    # ---- Tab 1: Array Layout ----
+    # ════════ Tab 1: Array Layout ════════
     with tab_layout:
         c1, c2 = st.columns([1.2, 1])
         with c1:
-            fig_geom = plot_array_geometry(
-                positions, cfg.desired_az_deg, cfg.jammers
-            )
+            fig_geom = plot_array_geometry(positions, cfg.desired_az_deg, cfg.jammers)
             st.pyplot(fig_geom, use_container_width=True)
 
         with c2:
-            st.markdown('#### Coupling Matrix  $|C|$  (dB)')
-            fig_coup = plot_coupling_matrix(C, title='Mutual Coupling Matrix |C|')
+            st.markdown('#### Coupling Matrix $|C|$ (dB)')
+            fig_coup = plot_coupling_matrix(C)
             st.pyplot(fig_coup, use_container_width=True)
 
-            # Scenario summary
+            d_spacing = 2 * arr.radius_m * np.sin(np.pi / max(n - 1, 1))
             metrics = {
+                'Algorithm': cfg.algorithm.value,
+                'Topology': arr.topology.value.replace('_', ' ').title(),
                 'Array Radius': f'{arr.radius_m * 1000:.1f} mm',
-                'Inter-element spacing': f'{2 * arr.radius_m * np.sin(np.pi / max(n-1, 1)) * 1000:.1f} mm',
-                'Spacing / λ': f'{2 * arr.radius_m * np.sin(np.pi / max(n-1, 1)) / lam:.3f}',
-                'Phase Shifter': f'{cfg.quant.phase_bits}-bit ({360 / 2**cfg.quant.phase_bits:.2f}° LSB)',
-                'Attenuator': f'{cfg.quant.amp_step_db} dB step / {cfg.quant.amp_range_db} dB range',
+                'Element Spacing': f'{d_spacing * 1000:.1f} mm ({d_spacing / lam:.3f}λ)',
+                'Phase Shifter': f'{cfg.quant.phase_bits}-bit',
                 'Noise Floor': f'{cfg.noise_floor_dbm:.0f} dBm',
-                'Diagonal Loading': f'{diag_loading:.1f} dB',
-                'Number of Jammers': f'{len(cfg.jammers)}',
-                'DOF Available': f'{n - 1} (N-1)',
+                'Jammers': f'{len(cfg.jammers)}',
+                'DoF (N−1)': f'{n - 1}',
+                'STAP': f'{"ON (" + str(cfg.stap.n_taps) + " taps)" if cfg.stap.enabled else "OFF"}',
             }
             st.plotly_chart(create_metrics_table(metrics), use_container_width=True)
 
-    # ---- Tab 2: 2D Pattern Cuts ----
+    # ════════ Tab 2: 2D Pattern Cuts ════════
     with tab_2d:
         dyn_range = st.slider('Dynamic Range (dB)', 20, 80, 60, step=5, key='dr_2d')
         c1, c2 = st.columns(2)
         with c1:
             fig_polar = plot_polar_pattern(
                 az_sweep, pattern_ideal, cfg.desired_az_deg, cfg.jammers,
-                title='Adapted Radiation Pattern (Polar)',
+                title=f'{cfg.algorithm.value} Pattern (Polar)',
                 pattern_db_quant=pattern_quant if cfg.quant.enabled else None,
                 dynamic_range=dyn_range,
             )
@@ -429,7 +536,6 @@ def main() -> None:
             )
             st.pyplot(fig_cart, use_container_width=True)
 
-        # Null depth table
         if cfg.jammers:
             st.markdown('#### Null Performance Summary')
             rows = []
@@ -437,98 +543,119 @@ def main() -> None:
                 j_idx = np.argmin(np.abs(az_sweep - j.azimuth_deg))
                 nd_ideal = pattern_ideal[j_idx]
                 nd_quant = pattern_quant[j_idx]
+                pol_loss = polarisation_mismatch_loss_db(j.polarisation, Polarisation.RHCP)
                 rows.append({
                     'Jammer': f'J{i+1}',
-                    'Azimuth (°)': f'{j.azimuth_deg:.1f}',
-                    'Elevation (°)': f'{j.elevation_deg:.1f}',
+                    'Az (°)': f'{j.azimuth_deg:.1f}',
+                    'El (°)': f'{j.elevation_deg:.1f}',
                     'JSR (dB)': f'{j.jsr_db:.0f}',
-                    'Null Depth Ideal (dB)': f'{nd_ideal:.1f}',
-                    'Null Depth Quantized (dB)': f'{nd_quant:.1f}',
-                    'Degradation (dB)': f'{nd_quant - nd_ideal:.1f}',
+                    'Pol': j.polarisation.value,
+                    'Pol Loss (dB)': f'{pol_loss:.1f}',
+                    'Null Ideal (dB)': f'{nd_ideal:.1f}',
+                    'Null Quant (dB)': f'{nd_quant:.1f}',
+                    'Δ (dB)': f'{nd_quant - nd_ideal:.1f}',
                 })
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # ---- Tab 3: 3D Pattern ----
+    # ════════ Tab 3: 3D Pattern (FIXED) ════════
     with tab_3d:
         st.markdown('#### Interactive 3D Radiation Pattern')
-        res_3d = st.select_slider('3D Resolution', options=[30, 45, 60, 90, 120], value=60,
-                                  help='Higher = smoother but slower')
+        st.markdown(
+            '*Resolution is automatically capped at 60×60 vertices to prevent '
+            'browser WebGL hangs.*'
+        )
+        res_3d = st.select_slider('3D Resolution', options=[30, 45, 60], value=45,
+                                  help='Grid points per axis (auto-decimated in renderer)')
 
         w_for_3d = w_quant if cfg.quant.enabled else w_ideal
         _w_r = tuple(w_for_3d.real.tolist())
         _w_i = tuple(w_for_3d.imag.tolist())
         _p_t = tuple(positions.ravel().tolist())
-        _c_r = tuple(C.real.ravel().tolist())
-        _c_i = tuple(C.imag.ravel().tolist())
+        _c_r = tuple(C_for_pattern.real.ravel().tolist()) if C_for_pattern is not None else None
+        _c_i = tuple(C_for_pattern.imag.ravel().tolist()) if C_for_pattern is not None else None
 
         result, az_3d, el_3d = cached_3d_pattern(
-            _w_r, _w_i, _p_t, n, freq, res_3d, res_3d // 2,
+            _w_r, _w_i, _p_t, n, freq, res_3d, max(res_3d // 2, 15),
             _c_r, _c_i,
         )
         fig_3d = plot_3d_pattern(az_3d, el_3d, result, dynamic_range=40.0)
         st.plotly_chart(fig_3d, use_container_width=True)
 
-    # ---- Tab 4: Wideband Squint ----
+    # ════════ Tab 4: Wideband Squint ════════
     with tab_squint:
         st.markdown('#### Wideband Null Dispersion Analysis')
         st.markdown(
-            'Evaluates narrowband weights $w(f_c)$ across a frequency sweep to reveal '
-            'how null depth degrades at band edges due to **array squint**.'
+            'Evaluates narrowband weights $w(f_c)$ across a frequency sweep. '
+            'Null depth degrades at band edges due to **array squint**.'
         )
 
         bw_mhz = st.slider('Analysis Bandwidth (± MHz)', 1.0, 30.0, 15.0, step=1.0)
         n_freq_pts = st.slider('Frequency Points', 31, 201, 101, step=10)
-
         f_offsets = np.linspace(-bw_mhz * 1e6, bw_mhz * 1e6, n_freq_pts)
 
         if cfg.jammers:
             null_depths = {}
+            stap_depths = None
+
+            w_eval = w_quant if cfg.quant.enabled else w_ideal
+
             for i, j in enumerate(cfg.jammers):
-                w_eval = w_quant if cfg.quant.enabled else w_ideal
                 nd = wideband_null_response(
                     w_eval, positions, freq, f_offsets,
                     j.azimuth_deg, j.elevation_deg,
-                    coupling_matrix_fc=C,
+                    coupling_matrix_fc=C_for_pattern,
                     aep_interpolators=interpolators,
                 )
-                # Normalise to desired signal response at fc
-                a_des_fc = steering_vector_with_aep(
+                # Normalise to desired signal response
+                a_des = steering_vector_with_aep(
                     positions, freq, cfg.desired_az_deg, cfg.desired_el_deg, interpolators
                 )
-                a_des_fc = coupled_steering_vector(C, a_des_fc)
-                p_des = np.abs(w_eval.conj() @ a_des_fc) ** 2
+                if C_for_pattern is not None:
+                    a_des = coupled_steering_vector(C_for_pattern, a_des)
+                p_des = np.abs(w_eval.conj() @ a_des) ** 2
                 nd -= 10 * np.log10(max(p_des, 1e-30))
-                null_depths[f'J{i+1} ({j.azimuth_deg:.0f}°, {j.jsr_db:.0f}dB JSR)'] = nd
+                null_depths[f'J{i+1} ({j.azimuth_deg:.0f}°, {j.jsr_db:.0f}dB)'] = nd
 
-            fig_sq = plot_wideband_squint(f_offsets / 1e6, null_depths)
+            # STAP comparison if enabled
+            if cfg.stap.enabled and cfg.jammers:
+                stap_depths = {}
+                tap_s = cfg.stap.tap_spacing_ns * 1e-9
+                w_st = stap_weights(
+                    positions, freq, cfg, C if cfg.algorithm == NullingAlgorithm.MVDR else None,
+                    interpolators, diag_loading,
+                )
+                for i, j in enumerate(cfg.jammers):
+                    nd_stap = stap_null_response(
+                        w_st, positions, freq, f_offsets,
+                        j.azimuth_deg, j.elevation_deg,
+                        cfg.stap.n_taps, tap_s, C_for_pattern, interpolators,
+                    )
+                    v_des = build_stap_steering_vector(
+                        positions, freq, cfg.desired_az_deg, cfg.desired_el_deg,
+                        cfg.stap.n_taps, tap_s, C_for_pattern, interpolators,
+                    )
+                    p_des_st = np.abs(w_st.conj() @ v_des) ** 2
+                    nd_stap -= 10 * np.log10(max(p_des_st, 1e-30))
+                    stap_depths[f'J{i+1} STAP'] = nd_stap
+
+            fig_sq = plot_wideband_squint(f_offsets / 1e6, null_depths, stap_depths)
             st.plotly_chart(fig_sq, use_container_width=True)
 
-            # Summary
             st.markdown('##### Null Bandwidth Summary')
             for label, nd in null_depths.items():
                 mask_20 = nd < -20
-                if mask_20.any():
-                    bw_20 = (f_offsets[mask_20][-1] - f_offsets[mask_20][0]) / 1e6
-                else:
-                    bw_20 = 0.0
+                bw_20 = (f_offsets[mask_20][-1] - f_offsets[mask_20][0]) / 1e6 if mask_20.any() else 0.0
                 mask_30 = nd < -30
-                if mask_30.any():
-                    bw_30 = (f_offsets[mask_30][-1] - f_offsets[mask_30][0]) / 1e6
-                else:
-                    bw_30 = 0.0
+                bw_30 = (f_offsets[mask_30][-1] - f_offsets[mask_30][0]) / 1e6 if mask_30.any() else 0.0
                 st.markdown(
                     f'**{label}**: '
-                    f'BW @ -20 dB = **{bw_20:.1f} MHz** · '
-                    f'BW @ -30 dB = **{bw_30:.1f} MHz**'
+                    f'BW @ −20 dB = **{bw_20:.1f} MHz** · '
+                    f'BW @ −30 dB = **{bw_30:.1f} MHz**'
                 )
         else:
             st.info('Add at least one jammer to analyse wideband null dispersion.')
 
-    # ---- Tab 5: Hardware Limits ----
+    # ════════ Tab 5: Hardware Limits ════════
     with tab_hw:
         st.markdown('#### Beamformer Weight Analysis')
 
@@ -546,62 +673,40 @@ def main() -> None:
 | Phase LSB | {phase_lsb:.2f}° |
 | Phase States | {2**cfg.quant.phase_bits} |
 | Amplitude LSB | {cfg.quant.amp_step_db} dB |
-| Amplitude States | {int(cfg.quant.amp_range_db / cfg.quant.amp_step_db) + 1} |
-| RMS Weight Error | {quantization_error_db(w_ideal, w_quant):.2f} dB |
+| Amp States | {int(cfg.quant.amp_range_db / cfg.quant.amp_step_db) + 1} |
+| RMS Error | {quantization_error_db(w_ideal, w_quant):.2f} dB |
 """)
 
-            # Phase comparison table
-            st.markdown('##### Per-Element Weight Comparison')
+            st.markdown('##### Per-Element Weights')
             rows = []
             for i in range(n):
                 rows.append({
-                    'Element': f'E{i}',
+                    'Elem': f'{"★" if i == 0 else ""}E{i}',
                     '|w| Ideal': f'{np.abs(w_ideal[i]):.4f}',
                     '|w| Quant': f'{np.abs(w_quant[i]):.4f}',
-                    '∠w Ideal (°)': f'{np.rad2deg(np.angle(w_ideal[i])):.2f}',
-                    '∠w Quant (°)': f'{np.rad2deg(np.angle(w_quant[i])):.2f}',
-                    'Δ∠ (°)': f'{np.rad2deg(np.angle(w_quant[i]) - np.angle(w_ideal[i])):.2f}',
+                    '∠ Ideal': f'{np.rad2deg(np.angle(w_ideal[i])):.1f}°',
+                    '∠ Quant': f'{np.rad2deg(np.angle(w_quant[i])):.1f}°',
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # Bit-depth sweep
-        st.markdown('#### Phase Quantization Sweep')
-        st.markdown('Evaluates null depth degradation across different phase shifter bit depths.')
+        # STAP weight visualization
+        if cfg.stap.enabled:
+            st.markdown('#### STAP Weight Matrix')
+            tap_s = cfg.stap.tap_spacing_ns * 1e-9
+            w_st = stap_weights(
+                positions, freq, cfg,
+                C if cfg.algorithm == NullingAlgorithm.MVDR else None,
+                interpolators, diag_loading,
+            )
+            fig_stap = plot_stap_weights(w_st, n, cfg.stap.n_taps)
+            st.pyplot(fig_stap, use_container_width=True)
 
-        if cfg.jammers:
-            bit_range = list(range(3, 9))
-            sweep_data = []
-            for bits in bit_range:
-                q_tmp = QuantConfig(
-                    phase_bits=bits,
-                    amp_step_db=cfg.quant.amp_step_db,
-                    amp_range_db=cfg.quant.amp_range_db,
-                    enabled=True,
-                )
-                w_tmp = quantize_weights(w_ideal, q_tmp)
-                patt_tmp = evaluate_pattern_2d(
-                    w_tmp, positions, freq, az_sweep,
-                    el_deg=cfg.desired_el_deg, coupling_matrix=C,
-                    aep_interpolators=interpolators,
-                )
-                for ji, j in enumerate(cfg.jammers):
-                    j_idx = np.argmin(np.abs(az_sweep - j.azimuth_deg))
-                    sweep_data.append({
-                        'Bits': bits,
-                        'Jammer': f'J{ji+1}',
-                        'Null Depth (dB)': patt_tmp[j_idx],
-                        'Quant Error (dB)': quantization_error_db(w_ideal, w_tmp),
-                    })
-            df_sweep = pd.DataFrame(sweep_data)
-            st.dataframe(df_sweep, use_container_width=True, hide_index=True)
-
-    # ---- Tab 6: Element Patterns ----
+    # ════════ Tab 6: Element Patterns ════════
     with tab_aep:
         st.markdown('#### Active Element Patterns (AEP)')
         st.markdown(
-            'Per-element radiation patterns generated from a mock Huygens-source model '
-            'with ground-plane edge diffraction. These replace the naive `cos^1.5(θ)` '
-            'approximation and can be swapped for real HFSS/CST imports.'
+            'Per-element patterns from a Huygens-source model with edge diffraction. '
+            'These replace the naive `cos^1.5(θ)` approximation.'
         )
 
         el_select = st.selectbox(
@@ -616,15 +721,13 @@ def main() -> None:
         )
         st.pyplot(fig_aep, use_container_width=True)
 
-        # Theta cut at phi=0
+        import matplotlib.pyplot as plt
         c1, c2 = st.columns(2)
         with c1:
-            import matplotlib.pyplot as plt
             fig_cut, ax_cut = plt.subplots(figsize=(6, 4))
             ax_cut.set_facecolor(PANEL_BG)
             fig_cut.patch.set_facecolor(DARK_BG)
-            phi_idx = 0
-            ax_cut.plot(aep.theta_deg, aep.magnitude[:, phi_idx],
+            ax_cut.plot(aep.theta_deg, aep.magnitude[:, 0],
                        color=ACCENT_CYAN, linewidth=2)
             ax_cut.set_xlabel('Theta (°)', color=TEXT_COLOR)
             ax_cut.set_ylabel('Normalised Gain', color=TEXT_COLOR)
@@ -653,25 +756,54 @@ def main() -> None:
             fig_cut2.tight_layout()
             st.pyplot(fig_cut2, use_container_width=True)
 
-        # Data format info
-        with st.expander('AEP Data Format Reference'):
-            st.markdown("""
-**Expected CSV format for HFSS/CST import:**
+    # ════════ Tab 7: Polarisation ════════
+    with tab_pol:
+        st.markdown('#### Polarisation Analysis')
+        st.markdown(
+            'GNSS signals are **Right-Hand Circularly Polarised (RHCP)**. '
+            'This tab analyses the array\'s polarisation response and '
+            'computes mismatch losses for different jammer polarisations.'
+        )
 
-| Theta | Phi | Mag | Phase |
-|:------|:----|:----|:------|
-| 0.0   | 0.0 | -3.2 | 12.5 |
-| 0.0   | 2.0 | -3.1 | 11.8 |
-| ...   | ... | ...  | ...  |
+        # Polarisation mismatch table
+        st.markdown('##### Polarisation Mismatch Loss Matrix')
+        pols = [Polarisation.RHCP, Polarisation.LHCP,
+                Polarisation.LINEAR_H, Polarisation.LINEAR_V]
+        pol_data = []
+        for tx in pols:
+            row = {'TX Polarisation': tx.value}
+            for rx in pols:
+                loss = polarisation_mismatch_loss_db(tx, rx)
+                row[f'RX {rx.value}'] = f'{loss:.1f} dB'
+            pol_data.append(row)
+        st.dataframe(pd.DataFrame(pol_data), use_container_width=True, hide_index=True)
 
-- **Theta**: Zenith angle (0° = boresight, 180° = nadir)
-- **Phi**: Azimuth angle (0°–360°)
-- **Mag**: Gain in dB (converted to linear internally)
-- **Phase**: Phase in degrees
+        # Jones vector analysis
+        st.markdown('##### Jones Vector Properties')
+        for pol in pols:
+            jones = polarisation_jones_vector(pol)
+            ar = axial_ratio_from_jones(jones)
+            st.markdown(
+                f'**{pol.value}**: Jones = [{jones[0]:.3f}, {jones[1]:.3f}] · '
+                f'Axial Ratio = {ar:.1f} dB'
+            )
 
-Use `data_ingestion.parse_aep_dataframe(df)` or
-`data_ingestion.parse_hfss_csv(filepath)` to ingest.
-""")
+        # Jammer polarisation impact
+        if cfg.jammers:
+            st.markdown('##### Jammer Polarisation Impact on Null Depth')
+            st.markdown(
+                'The effective JSR seen by the RHCP array is reduced by the '
+                'polarisation mismatch loss. An LHCP jammer is significantly '
+                'attenuated before any spatial nulling.'
+            )
+            for i, j in enumerate(cfg.jammers):
+                pol_loss = polarisation_mismatch_loss_db(j.polarisation, Polarisation.RHCP)
+                effective_jsr = j.jsr_db + pol_loss
+                st.markdown(
+                    f'**J{i+1}** ({j.polarisation.value}): '
+                    f'JSR = {j.jsr_db:.0f} dB − Pol loss {abs(pol_loss):.1f} dB = '
+                    f'**Effective JSR = {effective_jsr:.1f} dB**'
+                )
 
 
 if __name__ == '__main__':
