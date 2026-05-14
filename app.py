@@ -435,40 +435,64 @@ def main() -> None:
             p_des = np.abs(w_eval.conj() @ a_des) ** 2
             nd_squint -= 10 * np.log10(max(p_des, 1e-30))
 
-            # Matplotlib Figure generation (White background for IEEE PDF)
-            fig_ieee, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4), dpi=300)
-            fig_ieee.patch.set_facecolor('white')
+            # --- PLOT STYLING FIX START ---
+            # Using plt.style.context('default') ignores Streamlit's dark mode overrides
+            with plt.style.context('default'):
+                # Matplotlib Figure generation (White background for IEEE PDF)
+                fig_ieee, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4), dpi=300)
+                fig_ieee.patch.set_facecolor('white')
 
-            # --- Plot A: Quantization Collapse ---
-            ax1.set_facecolor('white')
-            ax1.plot(az_sweep, pattern_ideal, label='Ideal Weights', color='blue', linestyle='--')
-            if cfg.quant.enabled:
-                ax1.plot(az_sweep, pattern_quant, label=f'{cfg.quant.phase_bits}-bit Quantized', color='red')
-            ax1.axvline(x=j0.azimuth_deg, color='black', linestyle=':', label='Jammer DOA')
-            ax1.set_title('(a) Null Depth Collapse via Quantization', fontsize=11, fontweight='bold')
-            ax1.set_xlabel('Azimuth (°)', fontsize=10)
-            ax1.set_ylabel('Normalized Gain (dB)', fontsize=10)
-            ax1.set_xlim(0, 360)
-            ax1.set_ylim(-65, 5)
-            ax1.grid(True, linestyle=':', alpha=0.6)
-            ax1.legend(loc='lower right', fontsize=9)
+                # --- Plot A: Quantization Collapse ---
+                ax1.set_facecolor('white')
+                ax1.plot(az_sweep, pattern_ideal, label='Ideal Weights', color='blue', linestyle='--')
+                if cfg.quant.enabled:
+                    ax1.plot(az_sweep, pattern_quant, label=f'{cfg.quant.phase_bits}-bit Quantized', color='red')
+                ax1.axvline(x=j0.azimuth_deg, color='black', linestyle=':', label='Jammer DOA')
+                
+                # Explicitly set all text, ticks, and borders to black
+                ax1.set_title('(a) Null Depth Collapse via Quantization', fontsize=11, fontweight='bold', color='black')
+                ax1.set_xlabel('Azimuth (°)', fontsize=10, color='black')
+                ax1.set_ylabel('Normalized Gain (dB)', fontsize=10, color='black')
+                ax1.tick_params(colors='black')
+                for spine in ax1.spines.values():
+                    spine.set_edgecolor('black')
+                
+                ax1.set_xlim(0, 360)
+                ax1.set_ylim(-65, 5)
+                ax1.grid(True, linestyle=':', alpha=0.6, color='gray')
+                
+                # Enforce black text on legends
+                leg1 = ax1.legend(loc='lower right', fontsize=9, facecolor='white', edgecolor='black')
+                for text in leg1.get_texts():
+                    text.set_color('black')
 
-            # --- Plot B: Wideband Squint ---
-            ax2.set_facecolor('white')
-            ax2.plot(f_offsets / 1e6, nd_squint, color='purple', linewidth=2)
-            ax2.axhline(y=-30, color='red', linestyle='--', alpha=0.5, label='-30 dB Threshold')
-            ax2.set_title(f'(b) Wideband Squint at Az={j0.azimuth_deg}°', fontsize=11, fontweight='bold')
-            ax2.set_xlabel('Frequency Offset (MHz)', fontsize=10)
-            ax2.set_ylabel('Null Depth (dB)', fontsize=10)
-            ax2.set_xlim(-bw_mhz, bw_mhz)
-            ax2.set_ylim(-65, 0)
-            ax2.grid(True, linestyle=':', alpha=0.6)
-            ax2.legend(loc='lower left', fontsize=9)
+                # --- Plot B: Wideband Squint ---
+                ax2.set_facecolor('white')
+                ax2.plot(f_offsets / 1e6, nd_squint, color='purple', linewidth=2)
+                ax2.axhline(y=-30, color='red', linestyle='--', alpha=0.5, label='-30 dB Threshold')
+                
+                # Explicitly set all text, ticks, and borders to black
+                ax2.set_title(f'(b) Wideband Squint at Az={j0.azimuth_deg}°', fontsize=11, fontweight='bold', color='black')
+                ax2.set_xlabel('Frequency Offset (MHz)', fontsize=10, color='black')
+                ax2.set_ylabel('Null Depth (dB)', fontsize=10, color='black')
+                ax2.tick_params(colors='black')
+                for spine in ax2.spines.values():
+                    spine.set_edgecolor('black')
+                    
+                ax2.set_xlim(-bw_mhz, bw_mhz)
+                ax2.set_ylim(-65, 0)
+                ax2.grid(True, linestyle=':', alpha=0.6, color='gray')
+                
+                # Enforce black text on legends
+                leg2 = ax2.legend(loc='lower left', fontsize=9, facecolor='white', edgecolor='black')
+                for text in leg2.get_texts():
+                    text.set_color('black')
 
-            fig_ieee.tight_layout()
-            
-            # Display it cleanly in Streamlit
-            st.pyplot(fig_ieee)
+                fig_ieee.tight_layout()
+                # --- PLOT STYLING FIX END ---
+                
+                # Display it cleanly in Streamlit
+                st.pyplot(fig_ieee)
 
 if __name__ == '__main__':
     main()
