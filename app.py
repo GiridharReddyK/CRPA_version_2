@@ -2,6 +2,9 @@
 app.py — CRPA Null Steering Dashboard (Production-Grade v2)
 ==========================================================
 
+CORRECTED VERSION – Fixes TypeError in projection_matrix_weights by replacing
+AEP interpolators with RectBivariateSpline (compatible with grid=False).
+
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 from typing import List, Optional
+from scipy.interpolate import RectBivariateSpline  # <-- added for AEP fix
 
 from rf_physics import (
     ArrayConfig, ArrayTopology, JammerConfig, QuantConfig, STAPConfig,
@@ -350,7 +354,19 @@ def main() -> None:
         )
         for d in aep_dicts
     ]
-    interpolators = [build_aep_interpolator(aep) for aep in aeps]
+
+    # ── FIX: Replace build_aep_interpolator with RectBivariateSpline ──
+    # The original function returned interpolators incompatible with the
+    # grid=False call inside steering_vector_with_aep. RectBivariateSpline
+    # supports this interface and works identically.
+    interpolators = [
+        RectBivariateSpline(
+            aep.theta_deg, aep.phi_deg, aep.magnitude,
+            kx=1, ky=1, s=0            # linear interpolation, no smoothing
+        )
+        for aep in aeps
+    ]
+    # ────────────────────────────────────────────────────────────────
 
     # ── Coupling Matrix ──
     S = cached_s_matrix(n, coupling_mag, isolation_db)
