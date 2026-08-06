@@ -492,6 +492,73 @@ def main() -> None:
             }
             st.plotly_chart(create_metrics_table(metrics), use_container_width=True)
 
+        # ── Deliverable A: Relative Coordinates & Distances Table ──
+        # Coordinate system: central Element 0 is treated as the origin (0, 0).
+        # Units: millimetres (mm). Axis convention: +x → right, +y → up,
+        # matching the top-down orientation of the Array Geometry plot above.
+        st.markdown('---')
+        st.markdown('#### 📍 Relative Coordinates & Distances')
+        st.caption(
+            'Origin = central Element 0 (★). Units: millimetres (mm). '
+            'Axis convention: +x → right, +y → up (top-down view, same orientation '
+            'as the Array Geometry plot above).'
+        )
+        origin_xy_mm = positions[0, :2] * 1000.0
+        coord_rows = []
+        for i in range(n):
+            rel_xy_mm = positions[i, :2] * 1000.0 - origin_xy_mm
+            dist_mm = float(np.hypot(rel_xy_mm[0], rel_xy_mm[1]))
+            coord_rows.append({
+                'Element ID': f'{"★" if i == 0 else ""}E{i}',
+                'x (mm)': f'{rel_xy_mm[0]:.2f}',
+                'y (mm)': f'{rel_xy_mm[1]:.2f}',
+                'Distance from Origin (mm)': f'{dist_mm:.2f}',
+            })
+        st.dataframe(pd.DataFrame(coord_rows), use_container_width=True, hide_index=True)
+
+        # ── Deliverable B: Annotated Layout Diagram ──
+        st.markdown('#### 🗺️ Annotated Layout Diagram')
+        import matplotlib.pyplot as plt
+        fig_annot, ax_annot = plt.subplots(figsize=(6, 6))
+        ax_annot.set_facecolor(PANEL_BG)
+        fig_annot.patch.set_facecolor(DARK_BG)
+        for i in range(n):
+            rel_xy_mm = positions[i, :2] * 1000.0 - origin_xy_mm
+            dist_mm = float(np.hypot(rel_xy_mm[0], rel_xy_mm[1]))
+            is_origin = (i == 0)
+            ax_annot.scatter(
+                rel_xy_mm[0], rel_xy_mm[1],
+                s=170 if is_origin else 120,
+                color=ACCENT_RED if is_origin else ACCENT_CYAN,
+                edgecolors=TEXT_COLOR, linewidths=1.0, zorder=3,
+            )
+            if not is_origin:
+                ax_annot.plot(
+                    [0, rel_xy_mm[0]], [0, rel_xy_mm[1]],
+                    color='#3a4a63', linewidth=0.8, linestyle='--', zorder=1,
+                )
+            label = (
+                f'E{i} (Origin)\n(0.00, 0.00) mm'
+                if is_origin else
+                f'E{i}\n({rel_xy_mm[0]:.1f}, {rel_xy_mm[1]:.1f}) mm\nd={dist_mm:.1f} mm'
+            )
+            ax_annot.annotate(
+                label, (rel_xy_mm[0], rel_xy_mm[1]),
+                textcoords='offset points', xytext=(9, 9),
+                fontsize=8, color=TEXT_COLOR, family='monospace',
+            )
+        ax_annot.axhline(0, color='#1e2d42', linewidth=0.8)
+        ax_annot.axvline(0, color='#1e2d42', linewidth=0.8)
+        ax_annot.set_xlabel('x (mm)', color=TEXT_COLOR)
+        ax_annot.set_ylabel('y (mm)', color=TEXT_COLOR)
+        ax_annot.set_title('Element Positions Relative to Origin (E0)',
+                           color=TEXT_COLOR, fontsize=12, fontweight='bold')
+        ax_annot.tick_params(colors=TEXT_COLOR)
+        ax_annot.grid(True, alpha=0.3, color='#1e2d42')
+        ax_annot.set_aspect('equal', adjustable='datalim')
+        fig_annot.tight_layout()
+        st.pyplot(fig_annot, use_container_width=True)
+
     # --- Tab 2: 2D Pattern Cuts ---
     with tab_2d:
         dyn_range = st.slider('Dynamic Range (dB)', 20, 80, 60, step=5, key='dr_2d')
